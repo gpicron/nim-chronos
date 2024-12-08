@@ -60,6 +60,13 @@ task test, "Run all tests":
     if (NimMajor, NimMinor) > (1, 6):
       run args & " --mm:orc", "tests/testall"
 
+task test_stream, "Run all tests on Stream":
+  for args in testArguments:
+    # First run tests with `refc` memory manager.
+    run args & " --mm:refc", "tests/testasyncstream"
+    if (NimMajor, NimMinor) > (1, 6):
+      run args & " --mm:orc", "tests/testasyncstream"
+
 task test_v3_compat, "Run all tests in v3 compatibility mode":
   for args in testArguments:
     if (NimMajor, NimMinor) > (1, 6):

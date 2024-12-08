@@ -929,19 +929,50 @@ suite "TLSStream test suite":
                       "www.google.com"))
     check res == true
 
-  proc checkSSLServer(pemkey, pemcert: string): Future[bool] {.async.} =
+  test "Fails on no matching protocol":
+    proc headerClient(address: TransportAddress,
+                      name: string): Future[bool] {.async: (raises: []).} =
+      try:
+        var transp = await connect(address)
+        var reader = newAsyncStreamReader(transp)
+        var writer = newAsyncStreamWriter(transp)
+        var tlsstream = newTLSClientAsyncStream(reader, writer, name, flags = {FailOnAlpnMismatch}, protocolNames = @["h5"])
+        let selected = await tlsstream.selectedProtocol()
+      
+        await tlsstream.reader.closeWait()
+        await tlsstream.writer.closeWait()
+        await reader.closeWait()
+        await writer.closeWait()
+        await transp.closeWait()
+        
+        return selected.isNone 
+      except CatchableError as exc:
+        raiseAssert exc.msg
+
+    let res = waitFor(headerClient(resolveTAddress("www.google.com:443")[0],
+                      "www.google.com"))
+    check res == true
+
+  const testMessage = "TEST MESSAGE, protocol: "
+  proc checkSSLServer(pemkey, pemcert: string, 
+          clientProtos: Opt[seq[string]] = Opt.none(seq[string]), serverProtos: Opt[seq[string]] = Opt.none(seq[string])): Future[(string, Opt[string])] {.async.} =
     var key: TLSPrivateKey
     var cert: TLSCertificate
-    let testMessage = "TEST MESSAGE"
 
     proc serveClient(server: StreamServer,
                      transp: StreamTransport) {.async: (raises: []).} =
       try:
         var reader = newAsyncStreamReader(transp)
         var writer = newAsyncStreamWriter(transp)
-        var sstream = newTLSServerAsyncStream(reader, writer, key, cert)
+        var sstream = 
+          if serverProtos.isSome:
+            newTLSServerAsyncStream(reader, writer, key, cert, protocolNames = serverProtos.get)
+          else:
+            newTLSServerAsyncStream(reader, writer, key, cert)
+
         await handshake(sstream)
-        await sstream.writer.write(testMessage & "\r\n")
+        let proto = await sstream.selectedProtocol()
+        await sstream.writer.write(testMessage & $proto & "\r\n")
         await sstream.writer.finish()
         await sstream.writer.closeWait()
         await sstream.reader.closeWait()
@@ -964,7 +995,13 @@ suite "TLSStream test suite":
     var cwriter = newAsyncStreamWriter(conn)
     # We are using self-signed certificate
     let flags = {NoVerifyHost, NoVerifyServerName}
-    var cstream = newTLSClientAsyncStream(creader, cwriter, "", flags = flags)
+    var cstream = 
+      if clientProtos.isSome:
+        newTLSClientAsyncStream(creader, cwriter, "", flags = flags, protocolNames = clientProtos.get)
+      else:
+        newTLSClientAsyncStream(creader, cwriter, "", flags = flags)
+
+    let proto = await cstream.selectedProtocol()
     let res = await cstream.reader.read()
     await cstream.reader.closeWait()
     await cstream.writer.closeWait()
@@ -972,11 +1009,31 @@ suite "TLSStream test suite":
     await cwriter.closeWait()
     await conn.closeWait()
     await server.join()
-    return string.fromBytes(res) == (testMessage & "\r\n")
+
+    
+    return (string.fromBytes(res), proto)
 
   test "Simple server with RSA self-signed certificate":
     let res = waitFor(checkSSLServer(SelfSignedRsaKey, SelfSignedRsaCert))
-    check res == true
+    echo res
+    check res == (testMessage & "none()\r\n", Opt.none(string))
+
+  test "H2 server with h2 RSA self-signed certificate, with client not h2":
+    let res = waitFor(checkSSLServer(SelfSignedRsaKey, SelfSignedRsaCert, serverProtos = Opt.some(@["h2"])))
+    check res == (testMessage & "none()\r\n", Opt.none(string))
+
+  test "H2 server with none RSA self-signed certificate, with client  h2":
+    let res = waitFor(checkSSLServer(SelfSignedRsaKey, SelfSignedRsaCert, clientProtos = Opt.some(@["h2"])))
+    check res == (testMessage & "none()\r\n", Opt.none(string))
+
+  test "H2 server with h2 RSA self-signed certificate, with client h2":
+    let res = waitFor(checkSSLServer(SelfSignedRsaKey, SelfSignedRsaCert, clientProtos = Opt.some(@["h2"]), serverProtos = Opt.some(@["h2"])))
+    check res == (testMessage & "ok(h2)\r\n", Opt.some("h2"))
+
+  test "H2 server with bar,h2 RSA self-signed certificate, with client h2, foo":
+    let res = waitFor(checkSSLServer(SelfSignedRsaKey, SelfSignedRsaCert, clientProtos = Opt.some(@["bar", "h2"]), serverProtos = Opt.some(@["h2", "foo"])))
+    check res == (testMessage & "ok(h2)\r\n", Opt.some("h2"))
+
 
   test "Custom TrustAnchors test":
     proc checkTrustAnchors(testMessage: string): Future[string] {.async.} =
