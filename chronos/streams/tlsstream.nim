@@ -466,7 +466,8 @@ proc newTLSClientAsyncStream*(
        minVersion = TLSVersion.TLS12,
        maxVersion = TLSVersion.TLS12,
        flags: set[TLSFlags] = {},
-       trustAnchors: SomeTrustAnchorType = MozillaTrustAnchors
+       trustAnchors: SomeTrustAnchorType = MozillaTrustAnchors,
+       protocolNames: openArray[string] = @[]
      ): TLSAsyncStream {.raises: [TLSStreamInitError].} =
   ## Create new TLS asynchronous stream for outbound (client) connections
   ## using reading stream ``rsource`` and writing stream ``wsource``.
@@ -489,6 +490,11 @@ proc newTLSClientAsyncStream*(
   ## anchors other than the default Mozilla trust anchors. If you pass
   ## a ``TrustAnchorStore`` you should reuse the same instance for
   ## every call to avoid making a copy of the trust anchors per call.
+  ## 
+  ## ``protocolNames`` - list of application protocol names to be used
+  ## during the handshake. The first protocol name that is supported by
+  ## the server will be used.
+  ## 
   when trustAnchors is TrustAnchorStore:
     doAssert(len(trustAnchors.anchors) > 0,
              "Empty trust anchor list is invalid")
@@ -531,6 +537,12 @@ proc newTLSClientAsyncStream*(
                      uint(len(res.sbuffer)), 1)
   sslEngineSetVersions(res.ccontext.eng, uint16(minVersion),
                        uint16(maxVersion))
+  
+  if len(protocolNames) > 0:
+    sslEngineSetProtocolNames(res.ccontext.eng, allocCStringArray(protocolNames), uint(protocolNames.len))
+
+  if TLSFlags.FailOnAlpnMismatch in flags:
+    sslEngineAddFlags(res.ccontext.eng, OPT_FAIL_ON_ALPN_MISMATCH)
 
   if TLSFlags.NoVerifyServerName in flags:
     let err = sslClientReset(res.ccontext, nil, 0)
@@ -559,7 +571,8 @@ proc newTLSServerAsyncStream*(rsource: AsyncStreamReader,
                               minVersion = TLSVersion.TLS11,
                               maxVersion = TLSVersion.TLS12,
                               cache: TLSSessionCache = nil,
-                              flags: set[TLSFlags] = {}): TLSAsyncStream {.
+                              flags: set[TLSFlags] = {},
+                              protocolNames: openArray[string] = @[]): TLSAsyncStream {.
      raises: [TLSStreamInitError, TLSStreamProtocolError].} =
   ## Create new TLS asynchronous stream for inbound (server) connections
   ## using reading stream ``rsource`` and writing stream ``wsource``.
@@ -611,6 +624,8 @@ proc newTLSServerAsyncStream*(rsource: AsyncStreamReader,
                      uint(len(res.sbuffer)), 1)
   sslEngineSetVersions(res.scontext.eng, uint16(minVersion),
                        uint16(maxVersion))
+  if len(protocolNames) > 0:
+    sslEngineSetProtocolNames(res.scontext.eng, allocCStringArray(protocolNames), uint(protocolNames.len))
 
   if not isNil(cache):
     sslServerSetCache(
@@ -817,3 +832,36 @@ proc handshake*(rws: SomeTLSStreamType): Future[void] {.
       rws.reader.handshakeFut = retFuture
       rws.writer.handshakeFut = retFuture
   retFuture
+
+proc selectedProtocol*(rws: SomeTLSStreamType): Future[Opt[string]] {.async.} =
+  ## Get selected application protocol names.
+  await handshake(rws)
+  
+  when rws is TLSStreamReader:
+    var engine =
+      case rws.kind
+      of TLSStreamKind.Server:
+        addr stream.scontext.eng
+      of TLSStreamKind.Client:
+        addr stream.ccontext.eng      
+  elif rws is TLSStreamWriter:
+    var engine =
+      case rws.kind
+      of TLSStreamKind.Server:
+        stream.scontext.eng
+      of TLSStreamKind.Client:
+        stream.ccontext.eng
+  elif rws is TLSAsyncStream:
+    var engine =
+      case rws.reader.kind
+      of TLSStreamKind.Server:
+        rws.scontext.eng
+      of TLSStreamKind.Client:
+        rws.ccontext.eng
+
+  let common = sslEngineGetSelectedProtocol(engine)
+
+  if common != nil:
+    result = Opt.some($common)
+  else:
+    result = Opt.none(string)
